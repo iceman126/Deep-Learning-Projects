@@ -2,7 +2,7 @@
 Cartpole:
 
 ![CartPole Demo Video](images/Cartpole_resized.gif)
-![CartPole Evaluation Scores](images/Cartpole_eval_resized.png)
+![CartPole Evaluation Scores](images/Cartpole_eval_resized_w500.png)
 
 ## Usage
 Training:
