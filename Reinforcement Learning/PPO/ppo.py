@@ -8,12 +8,12 @@ import datetime
 from pathlib import Path, PurePath
 import os
 import argparse
-import scipy
+from scipy import signal
 from statistics import mean
 
 # This class comes from "https://github.com/openai/spinningup/blob/2e0eff9bd019c317af908b72c056a33f14626602/spinup/algos/ppo/ppo.py"
 def discount_cumsum(x, discount):
-    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+    return signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
 
 # This class comes from "https://github.com/openai/spinningup/blob/2e0eff9bd019c317af908b72c056a33f14626602/spinup/algos/ppo/ppo.py"
 class PPOBuffer:
@@ -24,8 +24,8 @@ class PPOBuffer:
     """
 
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros((size, act_dim), dtype=np.float32)
+        self.obs_buf = np.zeros((size, *obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(size, dtype=np.int32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -156,18 +156,30 @@ class PPO(object):
         return model
 
     def act(self, state):
-        act_dist = self.actor_net(np.expand_dims(state,0))
+        pi_logits = self.actor_net(np.expand_dims(state,0))
         v = self.critic_net(np.expand_dims(state,0))
-
         # TODO: compute logp_a with tf.nn.log_softmax and tf.gather_nd (or tf.one_hot and tf.reduce_sum)
 
+        '''
         if self.step % 100 == 0:
             with self.summary_writer.as_default():
                 tf.summary.histogram("q_logits", act_dist, step=self.step)
                 tf.summary.histogram("act_dist", tf.nn.softmax(act_dist), step=self.step)
+        '''
         
-        a = tf.random.categorical(act_dist, num_samples=1).numpy()[0][0]
-        return a, v, logp_a
+        # a = tf.random.categorical(pi_logits, num_samples=1).numpy()[0][0]
+        a = tf.random.categorical(pi_logits, num_samples=1)
+        log_pi_logits = tf.nn.log_softmax(pi_logits)
+        logp_a = tf.gather_nd(log_pi_logits, indices=a, batch_dims=1)
+
+        return a.numpy()[0][0], v, logp_a
+
+    def get_logp(self, states, actions):
+        actions = np.expand_dims(actions, -1)
+        pi_logits = self.actor_net(states)
+        log_pi_logits = tf.nn.log_softmax(pi_logits)
+        selected_logp = tf.gather_nd(log_pi_logits, indices=actions, batch_dims=1)
+        return selected_logp
 
     def get_val(self, state):
         v = self.critic_net(np.expand_dims(state, 0))
@@ -183,35 +195,47 @@ class PPO(object):
         """
         self.buffer.store(s, a, r, v, logp)
 
-    def finish_path(self):
-        self.buffer.finish_path()
+    def finish_path(self, last_val):
+        self.buffer.finish_path(last_val)
 
     def train(self, batch_size=512, lr=1, gamma=0.99):
         # TODO: Need to find a better place to increase this variable
         self.step += 1
         
-        s_batch, a_batch, adv_batch, return_batch, logp_batch = self.buffer.get()
+        s_batch, a_batch, adv_batch, return_batch, logp_old_batch = self.buffer.get()
+
+        clip_ratio = 0.2
 
         with tf.GradientTape() as tape:
-            # TODO: finish update workflow
-            pi_logits = self.actor_net(s_batch)
+            # ratio
+            # tape.watch(self.actor_net.trainable_variables)
+            logp_batch = self.get_logp(s_batch, a_batch)
+            ratio = tf.exp(logp_batch - logp_old_batch)
+            min_adv = tf.where(adv_batch > 0, (1 + clip_ratio) * adv_batch, (1 - clip_ratio) * adv_batch)
+            pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_batch, min_adv))
 
+        gradients = tape.gradient(pi_loss, self.actor_net.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.actor_net.trainable_variables))
 
+        with tf.GradientTape() as tape:
+            # v loss
+            v_batch = self.get_val(s_batch)
+            v_loss = tf.reduce_mean((return_batch - v_batch)**2)
 
-            entropy_reg = tf.reduce_sum(-tf.nn.softmax(q_logits) * tf.nn.log_softmax(q_logits), -1)
-            q_values = tf.gather_nd(q_logits, indices=selected_actions, batch_dims=1)
-            target_q_values = tf.keras.backend.max(self.target_model(next_s_batch), -1)
-            # td_targets = tf.stop_gradient(rewards + 0.99 * target_q_values * not_done)
-            td_targets = rewards + 0.99 * target_q_values * not_done
-            # td_loss = tf.compat.v1.losses.huber_loss(q_values, td_targets)
-            td_loss = tf.compat.v1.losses.mean_squared_error(q_values, td_targets)
-            total_loss = td_loss - self._entropy_coef * entropy_reg
-            loss = tf.reduce_mean(input_tensor=total_loss)
+        gradients = tape.gradient(v_loss, self.critic_net.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.critic_net.trainable_variables))
+        # self.optimizer.apply_gradients(gradients)
 
-        self.entropy(entropy_reg)
-        self.td_loss(td_loss)
-        self.train_loss(loss)
+        # self.entropy(entropy_reg)
+        # self.td_loss(td_loss)
+        # self.train_loss(loss)
 
+        # tape.gradient(pi_loss, self.actor_net.trainable_variables)
+        # tape.gradient(v_loss, self.critic_net.trainable_variables)
+        # gradients = tape.gradient(loss, (self.actor_net.trainable_variables, self.critic_net.trainable_variables))
+        # self.optimizer.apply_gradients(gradients)
+
+        '''
         # Gradient Clipping
         if self._max_norm != None:
             gradients = tape.gradient(loss, self.model.trainable_variables)
@@ -220,16 +244,9 @@ class PPO(object):
         else:
             gradients = tape.gradient(loss, self.model.trainable_variables)
             self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        '''
 
-        # Soft Update
-        if self._soft_update:
-            self._run_soft_update()
-
-        # Peroidcally Update
-        else:
-            if self.step % self.update_freq == 0:
-                self.target_model.set_weights(self.model.get_weights())
-
+        '''
         # Save Model
         if self.step % self.save_freq == 0:
             self.save_model()
@@ -240,6 +257,7 @@ class PPO(object):
                 tf.summary.scalar("train_loss", self.train_loss.result(), step=self.step)
                 tf.summary.scalar("td_loss", self.td_loss.result(), step=self.step)
                 tf.summary.scalar("entropy", self.entropy.result(), step=self.step)
+        '''
                 
 def main(args):
     if not args.evaluate:
@@ -251,15 +269,16 @@ def train(args):
     env = gym.make(args.environment)
     agent = PPO(state_dim=env.observation_space.shape,
                 action_dim=env.action_space.n,
+                # action_dim=1,
                 lr=args.learning_rate,
-                steps_per_epoch=2000)
+                steps_per_epoch=200)
     
     max_score = 0
     e_count = 0
     s, r, done, ep_score = env.reset(), 0, False, 0
 
     while True:
-        for t in range(2000):   # TODO: replace 2000 with steps_per_epoch
+        for t in range(200):   # TODO: replace 2000 with steps_per_epoch
             # s = env.reset()
             a, v, logp = agent.act(s)
             # Slight weirdness here because we need value function at time T
@@ -272,13 +291,13 @@ def train(args):
             ep_score += r
             if done:
                 e_count += 1
-                last_val = r if d else agent.get_val(s)
+                last_val = r if done else agent.get_val(s)
                 agent.finish_path(last_val)
                 max_score = max(max_score, ep_score)
-                print('episode:', e_count, 'score:', score, 'max:', max_score)
-                s, r, done, ep_score = env.reset(), 0, False            # reset the environment
+                print('episode:', e_count, 'score:', ep_score, 'max:', max_score)
+                s, r, done, ep_score = env.reset(), 0, False, 0            # reset the environment
 
-        update()        
+        agent.train()        
 
         '''
         # Evaluation
@@ -309,7 +328,7 @@ def eval(args):
 
     env = gym.make(args.environment)
     # env = wrappers.Monitor(env, './eval_videos/{}/'.format(datetime.datetime.now().strftime("%m_%d_%Y-%H_%M_%S")))
-    agent = DQN(state_dim=env.observation_space.shape, action_dim=env.action_space.n, lr=args.learning_rate)
+    agent = PPO(state_dim=env.observation_space.shape, action_dim=env.action_space.n, lr=args.learning_rate)
     agent.restore(args.checkpoint_path)
 
     eval_episodes = 10
