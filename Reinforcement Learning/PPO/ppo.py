@@ -91,15 +91,17 @@ class PPOBuffer:
 
 class PPO(object):
     # def __init__(self, state_dim, action_dim, lr, exp_dir=None, max_norm=10.0, soft_update=True, entropy_coef=0.01, tau=0.001, init_buffer_size=1000):
-    def __init__(self, state_dim, action_dim, lr, steps_per_epoch=2000, gamma=0.99, lam=0.95, checkpoint_path=None, max_norm=10.0, entropy_coef=0.01):
+    def __init__(self, state_dim, action_dim, lr, train_epochs=5, clip_ratio=0.2, steps_per_epoch=2000, gamma=0.99, lam=0.95, checkpoint_path=None, max_norm=None, entropy_coef=0.0):
         self.step = 0
-        self.buffer = PPOBuffer(state_dim, action_dim, steps_per_epoch, gamma, lam)
-        self.lr = lr
-        self.actor_net = self._create_actor(state_dim, action_dim)
-        self.critic_net = self._create_critic(state_dim, action_dim)
+        self._buffer = PPOBuffer(state_dim, action_dim, steps_per_epoch, gamma, lam)
+        self._lr = lr
+        self._clip_ratio = clip_ratio
+        self.train_epochs = train_epochs
+        self._actor_net = self._create_actor(state_dim, action_dim)
+        self._critic_net = self._create_critic(state_dim, action_dim)
         self._state_dim = state_dim
         self._action_dim = action_dim
-        self.optimizer = tf.keras.optimizers.Adam(lr)
+        self._optimizer = tf.keras.optimizers.Adam(lr)
         self._max_norm = max_norm
         self._entropy_coef = entropy_coef
         
@@ -112,7 +114,7 @@ class PPO(object):
         self.log_dir = self.exp_dir / "tensorboard"
         self.checkpoint_dir = self.exp_dir / "checkpoints"
 
-        self.checkpoint = tf.train.Checkpoint(epoch=tf.Variable(1), actor_net=self.actor_net, critic_net=self.critic_net, optimizer=self.optimizer)
+        self.checkpoint = tf.train.Checkpoint(epoch=tf.Variable(1), actor_net=self._actor_net, critic_net=self._critic_net, optimizer=self._optimizer)
         self.checkpoint_manager = tf.train.CheckpointManager(self.checkpoint, str(self.checkpoint_dir), max_to_keep=None)
         # self._find_existing_checkpoints()
         if checkpoint_path != None:
@@ -156,9 +158,8 @@ class PPO(object):
         return model
 
     def act(self, state):
-        pi_logits = self.actor_net(np.expand_dims(state,0))
-        v = self.critic_net(np.expand_dims(state,0))
-        # TODO: compute logp_a with tf.nn.log_softmax and tf.gather_nd (or tf.one_hot and tf.reduce_sum)
+        pi_logits = self._actor_net(np.expand_dims(state,0))
+        v = self._critic_net(np.expand_dims(state,0))
 
         '''
         if self.step % 100 == 0:
@@ -167,22 +168,21 @@ class PPO(object):
                 tf.summary.histogram("act_dist", tf.nn.softmax(act_dist), step=self.step)
         '''
         
-        # a = tf.random.categorical(pi_logits, num_samples=1).numpy()[0][0]
         a = tf.random.categorical(pi_logits, num_samples=1)
         log_pi_logits = tf.nn.log_softmax(pi_logits)
         logp_a = tf.gather_nd(log_pi_logits, indices=a, batch_dims=1)
 
         return a.numpy()[0][0], v, logp_a
 
-    def get_logp(self, states, actions):
+    def get_pi_logp(self, states, actions):
         actions = np.expand_dims(actions, -1)
-        pi_logits = self.actor_net(states)
+        pi_logits = self._actor_net(states)
         log_pi_logits = tf.nn.log_softmax(pi_logits)
         selected_logp = tf.gather_nd(log_pi_logits, indices=actions, batch_dims=1)
-        return selected_logp
+        return pi_logits, selected_logp
 
     def get_val(self, state):
-        v = self.critic_net(np.expand_dims(state, 0))
+        v = self._critic_net(np.expand_dims(state, 0))
         return v
 
     def save_model(self):
@@ -193,58 +193,50 @@ class PPO(object):
         """
         Append one timestep of agent-environment interaction to the buffer.
         """
-        self.buffer.store(s, a, r, v, logp)
+        self._buffer.store(s, a, r, v, logp)
 
     def finish_path(self, last_val):
-        self.buffer.finish_path(last_val)
+        self._buffer.finish_path(last_val)
 
-    def train(self, batch_size=512, lr=1, gamma=0.99):
+    def train(self):
         # TODO: Need to find a better place to increase this variable
         self.step += 1
-        
-        s_batch, a_batch, adv_batch, return_batch, logp_old_batch = self.buffer.get()
 
-        clip_ratio = 0.2
+        s_batch, a_batch, adv_batch, return_batch, logp_old_batch = self._buffer.get()
 
-        with tf.GradientTape() as tape:
-            # ratio
-            # tape.watch(self.actor_net.trainable_variables)
-            logp_batch = self.get_logp(s_batch, a_batch)
-            ratio = tf.exp(logp_batch - logp_old_batch)
-            min_adv = tf.where(adv_batch > 0, (1 + clip_ratio) * adv_batch, (1 - clip_ratio) * adv_batch)
-            pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_batch, min_adv))
+        for train_epoch in range(self.train_epochs):
+            with tf.GradientTape() as tape:
+                # Clipped Objective
+                pi_logits, logp_batch = self.get_pi_logp(s_batch, a_batch)
+                importance_ratio = tf.exp(logp_batch - logp_old_batch)
+                importance_ratio_clipped = tf.clip_by_value(importance_ratio, 1 - self._clip_ratio, 1 + self._clip_ratio)
+                objective = importance_ratio * adv_batch
+                objective_clipped = importance_ratio_clipped * adv_batch
+                pi_loss = -tf.reduce_mean(tf.minimum(objective, objective_clipped))
 
-        gradients = tape.gradient(pi_loss, self.actor_net.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.actor_net.trainable_variables))
+                # Entropy
+                entropy_reg = tf.reduce_sum(-tf.nn.softmax(pi_logits) * tf.nn.log_softmax(pi_logits), -1)
 
-        with tf.GradientTape() as tape:
-            # v loss
-            v_batch = self.get_val(s_batch)
-            v_loss = tf.reduce_mean((return_batch - v_batch)**2)
+                # Value Loss
+                v_batch = self.get_val(s_batch)
+                v_loss = tf.reduce_mean(tf.math.squared_difference(return_batch, v_batch))
 
-        gradients = tape.gradient(v_loss, self.critic_net.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.critic_net.trainable_variables))
-        # self.optimizer.apply_gradients(gradients)
+                # Total Loss
+                loss = pi_loss + v_loss + self._entropy_coef * entropy_reg
+
+            # Gradient Clipping
+            variables_to_train = (self._actor_net.trainable_variables + self._critic_net.trainable_variables)
+            if self._max_norm != None:
+                gradients = tape.gradient(loss, variables_to_train)
+                clipped_gradients, _ = tf.clip_by_global_norm(gradients, self._max_norm)
+                self._optimizer.apply_gradients(zip(clipped_gradients, variables_to_train))
+            else:
+                gradients = tape.gradient(loss, variables_to_train)
+                self._optimizer.apply_gradients(zip(gradients, variables_to_train))
 
         # self.entropy(entropy_reg)
         # self.td_loss(td_loss)
         # self.train_loss(loss)
-
-        # tape.gradient(pi_loss, self.actor_net.trainable_variables)
-        # tape.gradient(v_loss, self.critic_net.trainable_variables)
-        # gradients = tape.gradient(loss, (self.actor_net.trainable_variables, self.critic_net.trainable_variables))
-        # self.optimizer.apply_gradients(gradients)
-
-        '''
-        # Gradient Clipping
-        if self._max_norm != None:
-            gradients = tape.gradient(loss, self.model.trainable_variables)
-            clipped_gradients, _ = tf.clip_by_global_norm(gradients, self._max_norm)
-            self.optimizer.apply_gradients(zip(clipped_gradients, self.model.trainable_variables))
-        else:
-            gradients = tape.gradient(loss, self.model.trainable_variables)
-            self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-        '''
 
         '''
         # Save Model
@@ -269,17 +261,15 @@ def train(args):
     env = gym.make(args.environment)
     agent = PPO(state_dim=env.observation_space.shape,
                 action_dim=env.action_space.n,
-                # action_dim=1,
                 lr=args.learning_rate,
-                steps_per_epoch=200)
+                steps_per_epoch=args.steps_per_epoch)
     
     max_score = 0
     e_count = 0
     s, r, done, ep_score = env.reset(), 0, False, 0
 
     while True:
-        for t in range(200):   # TODO: replace 2000 with steps_per_epoch
-            # s = env.reset()
+        for t in range(args.steps_per_epoch):
             a, v, logp = agent.act(s)
             # Slight weirdness here because we need value function at time T
             # before returning segment [0, T-1] so we get the correct
@@ -356,8 +346,8 @@ def eval(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-env', '--environment', help='The name of OpenAI Gym Envrionment. e.g. CartPole-v1', type=str, default="CartPole-v1")
+    parser.add_argument('-spe', '--steps_per_epoch', help="The number of steps to collect for one epoch", type=int, default=200)
     parser.add_argument('-lr', '--learning_rate', help='Learning Rate', type=float, default=0.0005)
-    parser.add_argument('-su', '--soft_update', help='Whether to use soft-update', action="store_true")
     parser.add_argument('-eval', '--evaluate', help="Evaluate mode", action="store_true")
     parser.add_argument('-cp', '--checkpoint_path', help="Checkpoint path", type=str, default=None)
     args = parser.parse_args()
