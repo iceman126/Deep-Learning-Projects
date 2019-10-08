@@ -81,18 +81,21 @@ class PPOBuffer:
         mean zero and std one). Also, resets some pointers in the buffer.
         """
         assert self.ptr == self.max_size    # buffer has to be full before you can get
+        # used_size = self.ptr
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
         # adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)           # only single thread for now, so we don't need MPI
         adv_mean, adv_std = np.mean(self.adv_buf), np.std(self.adv_buf)
         self.adv_buf = (self.adv_buf - adv_mean) / adv_std
         return [self.obs_buf, self.act_buf, self.adv_buf, self.ret_buf, self.logp_buf]
+        # return [self.obs_buf[:used_size], self.act_buf[:used_size], self.adv_buf[:used_size], self.ret_buf[:used_size], self.logp_buf[:used_size]]
 
 
 class PPO(object):
     # def __init__(self, state_dim, action_dim, lr, exp_dir=None, max_norm=10.0, soft_update=True, entropy_coef=0.01, tau=0.001, init_buffer_size=1000):
-    def __init__(self, state_dim, action_dim, lr, train_epochs=5, clip_ratio=0.2, steps_per_epoch=2000, gamma=0.99, lam=0.95, checkpoint_path=None, max_norm=None, entropy_coef=0.0):
-        self.step = 0
+    def __init__(self, state_dim, action_dim, lr, exp_dir, train_epochs=5, clip_ratio=0.2, steps_per_epoch=2000, gamma=0.99, lam=0.95, max_norm=None, entropy_coef=0.0, save_freq=10):
+        # self._epoch = 0
+        self._save_freq = save_freq
         self._buffer = PPOBuffer(state_dim, action_dim, steps_per_epoch, gamma, lam)
         self._lr = lr
         self._clip_ratio = clip_ratio
@@ -104,22 +107,15 @@ class PPO(object):
         self._optimizer = tf.keras.optimizers.Adam(lr)
         self._max_norm = max_norm
         self._entropy_coef = entropy_coef
-        
-        now = datetime.datetime.now()
-        self.exp_dir = Path(now.strftime("%m_%d_%Y-%H_%M_%S"))
-        try:
-            os.makedirs(str(self.exp_dir))
-        except FileExistsError:
-            print("Directory already exists")
-        self.log_dir = self.exp_dir / "tensorboard"
-        self.checkpoint_dir = self.exp_dir / "checkpoints"
+        self._exp_dir = exp_dir
+
+        os.makedirs(str(self._exp_dir), exist_ok=True)
+        self._log_dir = self._exp_dir / "tensorboard"
+        self._checkpoint_dir = self._exp_dir / "checkpoints"
 
         self.checkpoint = tf.train.Checkpoint(epoch=tf.Variable(1), actor_net=self._actor_net, critic_net=self._critic_net, optimizer=self._optimizer)
-        self.checkpoint_manager = tf.train.CheckpointManager(self.checkpoint, str(self.checkpoint_dir), max_to_keep=None)
-        # self._find_existing_checkpoints()
-        if checkpoint_path != None:
-            self.restore(checkpoint_path)
-
+        self.checkpoint_manager = tf.train.CheckpointManager(self.checkpoint, str(self._checkpoint_dir), max_to_keep=None)
+        self._find_existing_checkpoints()
         self._create_metrics()
 
     def restore(self, checkpoint_path):
@@ -127,7 +123,7 @@ class PPO(object):
         print("Restored from {}".format(checkpoint_path))
 
     def _create_metrics(self):
-        self.summary_writer = tf.summary.create_file_writer(str(self.log_dir))
+        self.summary_writer = tf.summary.create_file_writer(str(self._log_dir))
         self.train_loss = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
         self.td_loss = tf.keras.metrics.Mean('td_loss', dtype=tf.float32)
         self.entropy = tf.keras.metrics.Mean('entropy', dtype=tf.float32)
@@ -186,7 +182,7 @@ class PPO(object):
         return v
 
     def save_model(self):
-        saved_path = self.checkpoint_manager.save(self.step)
+        saved_path = self.checkpoint_manager.save(self.checkpoint.epoch)
         print('model saved at {}'.format(saved_path))
 
     def save_transition(self, s, a, r, v, logp):
@@ -199,9 +195,6 @@ class PPO(object):
         self._buffer.finish_path(last_val)
 
     def train(self):
-        # TODO: Need to find a better place to increase this variable
-        self.step += 1
-
         s_batch, a_batch, adv_batch, return_batch, logp_old_batch = self._buffer.get()
 
         for train_epoch in range(self.train_epochs):
@@ -234,18 +227,28 @@ class PPO(object):
                 gradients = tape.gradient(loss, variables_to_train)
                 self._optimizer.apply_gradients(zip(gradients, variables_to_train))
 
+
+            # Stop optimizing if kl-divergence is too large
+            _, logp_new_batch = self.get_pi_logp(s_batch, a_batch)
+            sampled_kl = tf.reduce_mean(logp_old_batch - logp_new_batch)      # a sample estimate for KL-divergence, easy to compute
+            if sampled_kl > 0.05 * 1.5:
+                print('Early stopping at traning epoch {} due to reaching max kl.'.format(train_epoch))
+                break
+
         # self.entropy(entropy_reg)
         # self.td_loss(td_loss)
         # self.train_loss(loss)
 
-        '''
         # Save Model
-        if self.step % self.save_freq == 0:
+        if self.checkpoint.epoch % self._save_freq == 0:
             self.save_model()
+        
+        self.checkpoint.epoch.assign_add(1)
 
+        '''
         # Write log to tensorboard
         if self.step % 100 == 0:
-            with self.summary_writer.as_default():
+            with self.summary_writer.as_default():^
                 tf.summary.scalar("train_loss", self.train_loss.result(), step=self.step)
                 tf.summary.scalar("td_loss", self.td_loss.result(), step=self.step)
                 tf.summary.scalar("entropy", self.entropy.result(), step=self.step)
@@ -258,18 +261,30 @@ def main(args):
         eval(args)
 
 def train(args):
+    # Create experiement dir
+    if args.checkpoint_path is None:
+        now = datetime.datetime.now()
+        exp_dir = Path(now.strftime("PPO_{}_%m_%d_%Y-%H_%M_%S").format(args.environment))
+    else:
+        exp_dir = Path(args.checkpoint_path)
+
+    steps_per_epoch = args.steps_per_epoch
+
     env = gym.make(args.environment)
     agent = PPO(state_dim=env.observation_space.shape,
                 action_dim=env.action_space.n,
                 lr=args.learning_rate,
-                steps_per_epoch=args.steps_per_epoch)
+                exp_dir=exp_dir,
+                steps_per_epoch=steps_per_epoch)
     
     max_score = 0
     e_count = 0
     s, r, done, ep_score = env.reset(), 0, False, 0
+    # epoch_count = 1
 
     while True:
-        for t in range(args.steps_per_epoch):
+        # Steps per epoch
+        for t in range(steps_per_epoch):
             a, v, logp = agent.act(s)
             # Slight weirdness here because we need value function at time T
             # before returning segment [0, T-1] so we get the correct
@@ -279,13 +294,20 @@ def train(args):
 
             s, r, done, _ = env.step(a)
             ep_score += r
-            if done:
-                e_count += 1
+            # step_count += 1
+
+            # if the episode is terminated or reach the maximum steps
+            if done or t == steps_per_epoch - 1:
+                # e_count += 1
                 last_val = r if done else agent.get_val(s)
                 agent.finish_path(last_val)
-                max_score = max(max_score, ep_score)
-                print('episode:', e_count, 'score:', ep_score, 'max:', max_score)
-                s, r, done, ep_score = env.reset(), 0, False, 0            # reset the environment
+
+                # reset the environment if the episode is finished
+                if done:
+                    e_count += 1
+                    max_score = max(max_score, ep_score)
+                    print('episode:', e_count, 'score:', ep_score, 'max:', max_score)
+                    s, r, done, ep_score = env.reset(), 0, False, 0            # reset the environment
 
         agent.train()        
 
